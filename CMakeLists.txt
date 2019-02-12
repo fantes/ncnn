@@ -44,6 +44,7 @@ if(NCNN_OPENMP)
         # Only works if the same flag is passed to the linker; use CMake 3.9+ otherwise (Intel, AppleClang)
         set_property(TARGET OpenMP::OpenMP_CXX
           PROPERTY INTERFACE_LINK_LIBRARIES ${OpenMP_CXX_FLAGS} Threads::Threads)
+	add_definitions(${OpenMP_CXX_FLAGS})
     endif()
 endif()
 

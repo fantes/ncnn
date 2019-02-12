@@ -13,6 +13,8 @@ if(NCNN_VULKAN)
 endif()
 
 add_executable(ncnn2mem ncnn2mem.cpp)
+set_property(TARGET ncnn2mem PROPERTY COMPILE_FLAGS "${OpenMP_CXX_FLAGS}")
+set_property(TARGET ncnn2mem PROPERTY LINK_FLAGS "${OpenMP_CXX_FLAGS}")
 
 target_link_libraries(ncnn2mem PRIVATE ncnn)
 
