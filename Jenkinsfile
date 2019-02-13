@@ -11,9 +11,9 @@ make -j24'''
     }
     stage('Benchmarks') {
       steps {
-        sh '''cd build/benchmarks
+        sh '''cd build/benchmark
 cp -r ../../benchmark/
-./benchmarks 8 4 0
+./benchncnn 8 4 0
 '''
       }
     }
