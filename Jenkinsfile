@@ -12,7 +12,7 @@ make -j24'''
     stage('Benchmarks') {
       steps {
         sh '''cd build/benchmark
-cp -r ../../benchmark/
+cp -r ../../benchmark/* .
 ./benchncnn 8 4 0
 '''
       }
