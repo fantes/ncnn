@@ -149,7 +149,7 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
     if (use_int8_inference)
     {
         if (keep_h)
-            return -101;
+	  return -101; // not implemented
         Mat bottom_blob_int8;
         bottom_blob_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
         if (bottom_blob_int8.empty())
@@ -239,6 +239,7 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
         return 0;
     }
 
+#pragma omp parallel for num_threads(opt.num_threads)
     for (int p=0; p<num_output; p++)
     {
         float sum = 0.f;
@@ -254,9 +255,6 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
 
             for (int i = 0; i < size; i++)
             {
-	      /*std::cout << "m[" << i << "]: " << m[i] << std::endl;
-                if (m[i] > 10.0)
-		std::cout << "w[" << i << "]: " << w[i] << std::endl;*/
                 sum += m[i] * w[i];
             }
         }
