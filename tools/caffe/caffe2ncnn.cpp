@@ -1006,7 +1006,11 @@ int main(int argc, char** argv)
             fprintf(pp, " 2=%d", weight_blob.data_size());
             // in OCR case, we need to keep H dimensions in order to do H inner products
             // custom inner product layer is needed for this
-            if (ocr)
+            // same for timeserie :
+            const caffe::LayerParameter& layer_before = proto.layer(i-1);
+            bool lstm_before = (layer_before.type() == "LSTM");
+
+            if (ocr || lstm_before)
                 fprintf(pp, " 3=1");
 
             bool int8_scale_term = false;
