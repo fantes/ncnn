@@ -93,6 +93,8 @@ public:
     // return 0 if success
     virtual int load_model(const ModelBin& mb);
 
+    virtual void set_h(int h) {(void)(h);}
+
 public:
     // one input and one output blob
     bool one_blob_only;
