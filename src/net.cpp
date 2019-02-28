@@ -917,6 +917,12 @@ Extractor Net::create_extractor() const
     return Extractor(this, blobs.size());
 }
 
+void Net::set_input_h(int h) const
+{
+    layers[0]->set_h(h);
+}
+
+
 #if NCNN_VULKAN
 void Net::set_vulkan_device(VulkanDevice* _vkdev)
 {

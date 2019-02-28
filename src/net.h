@@ -81,6 +81,8 @@ public:
 
     // construct an Extractor from network
     Extractor create_extractor() const;
+    void set_input_h(int h) const;
+
 
 public:
     // enable winograd convolution optimization

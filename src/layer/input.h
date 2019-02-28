@@ -28,6 +28,8 @@ public:
 
     virtual int forward_inplace(Mat& bottom_top_blob, const Option& opt) const;
 
+    virtual void set_h(const int h) {this->h = h;}
+
 public:
     int w;
     int h;
