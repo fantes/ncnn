@@ -13,7 +13,7 @@
 // specific language governing permissions and limitations under the License.
 
 #include "innerproduct.h"
-
+#include <algorithm>
 #include "layer_type.h"
 
 namespace ncnn {
@@ -24,27 +24,8 @@ InnerProduct::InnerProduct()
 {
     one_blob_only = true;
     support_inplace = false;
-    support_vulkan = true;
-
-#if NCNN_VULKAN
-    flatten = 0;
-
-    pipeline_innerproduct = 0;
-    pipeline_innerproduct_pack4 = 0;
-#endif // NCNN_VULKAN
 
     quantize = 0;
-    dequantize = 0;
-}
-
-InnerProduct::~InnerProduct()
-{
-#if NCNN_VULKAN
-    delete flatten;
-#endif // NCNN_VULKAN
-
-    delete quantize;
-    delete dequantize;
 }
 
 int InnerProduct::load_param(const ParamDict& pd)
@@ -53,27 +34,9 @@ int InnerProduct::load_param(const ParamDict& pd)
     bias_term = pd.get(1, 0);
     weight_data_size = pd.get(2, 0);
     int8_scale_term = pd.get(8, 0);
-
     keep_h = pd.get(3,0);
-
-    use_int8_inference = pd.use_int8_inference;
-
-    if (int8_scale_term == 0)
-        use_int8_inference = false;
-
-#if NCNN_VULKAN
-    if (pd.use_vulkan_compute)
-    {
-        flatten = ncnn::create_layer(ncnn::LayerType::Flatten);
-        flatten->vkdev = vkdev;
-
-        ncnn::ParamDict pd;
-        pd.use_vulkan_compute = 1;
-
-        flatten->load_param(pd);
-    }
-#endif // NCNN_VULKAN
-
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
     return 0;
 }
 
@@ -92,9 +55,22 @@ int InnerProduct::load_model(const ModelBin& mb)
 
     if (int8_scale_term)
     {
-        weight_data_int8_scale = mb.load(1, 1)[0];
+        weight_data_int8_scales = mb.load(num_output, 1);
         bottom_blob_int8_scale = mb.load(1, 1)[0];
     }
+
+    return 0;
+}
+
+int InnerProduct::create_pipeline(const Option& opt)
+{
+    Option opt_cpu = opt;
+    opt_cpu.use_vulkan_compute = false;
+
+    use_int8_inference = opt.use_int8_inference;
+
+    if (int8_scale_term == 0)
+        use_int8_inference = false;
 
     bool weight_data_is_int8 = (weight_data.elemsize == (size_t)1u);
     bool weight_data_is_float32 = (weight_data.elemsize == (size_t)4u);
@@ -105,28 +81,102 @@ int InnerProduct::load_model(const ModelBin& mb)
         return -1;
     }
 
+    // initial the quantize,dequantize op layer
     if (use_int8_inference)
     {
         quantize = ncnn::create_layer(ncnn::LayerType::Quantize);
-        dequantize = ncnn::create_layer(ncnn::LayerType::Dequantize);
+        {
+            ncnn::ParamDict pd;
+            pd.set(0, bottom_blob_int8_scale);// scale
+
+            quantize->load_param(pd);
+
+            quantize->create_pipeline(opt_cpu);
+        }
+
+        dequantize_ops.resize(num_output);
+        for (int n=0; n<num_output; n++)
+        {
+            dequantize_ops[n] = ncnn::create_layer(ncnn::LayerType::Dequantize);
+
+            float top_rescale = 1.f;
+
+            if (weight_data_int8_scales[n] == 0)
+                top_rescale = 0;
+            else
+                top_rescale = 1.f / (bottom_blob_int8_scale * weight_data_int8_scales[n]);
+
+            ncnn::ParamDict pd;
+            pd.set(0, top_rescale);// scale
+            pd.set(1, bias_term);  // bias_term
+            pd.set(2, 1);          // bias_data_size
+
+            dequantize_ops[n]->load_param(pd);
+
+            ncnn::Mat weights[1];
+            weights[0] = bias_data.range(n, 1);
+
+            dequantize_ops[n]->load_model(ModelBinFromMatArray(weights));
+
+            dequantize_ops[n]->create_pipeline(opt_cpu);
+        }
     }
 
+    // runtime quantize the weight data
     if (weight_data_is_float32 && use_int8_inference)
     {
         // quantize weight to int8
-        ncnn::ParamDict pd;
-        pd.set(0, weight_data_int8_scale);// scale
-
-        quantize->load_param(pd);
-
-        Mat int8_weight_data;
-        quantize->forward(weight_data, int8_weight_data);
-
+        Mat int8_weight_data(weight_data_size, (size_t)1u);
         if (int8_weight_data.empty())
             return -100;
 
+        const int weight_data_size_output = weight_data_size / num_output;
+
+        for (int n=0; n<num_output; n++)
+        {
+            Layer* op = ncnn::create_layer(ncnn::LayerType::Quantize);
+
+            ncnn::ParamDict pd;
+            pd.set(0, weight_data_int8_scales[n]);// scale
+
+            op->load_param(pd);
+
+            op->create_pipeline(opt_cpu);
+
+            ncnn::Option opt;
+            opt.blob_allocator = int8_weight_data.allocator;
+
+            const Mat weight_data_n = weight_data.range(weight_data_size_output * n, weight_data_size_output);
+            Mat int8_weight_data_n = int8_weight_data.range(weight_data_size_output * n, weight_data_size_output);
+            op->forward(weight_data_n, int8_weight_data_n, opt);
+
+            delete op;
+        }
+
         weight_data = int8_weight_data;
     }
+
+    return 0;
+}
+
+int InnerProduct::destroy_pipeline(const Option& opt)
+{
+    Option opt_cpu = opt;
+    opt_cpu.use_vulkan_compute = false;
+
+    if (quantize)
+    {
+        quantize->destroy_pipeline(opt_cpu);
+        delete quantize;
+        quantize = 0;
+    }
+
+    for (int i=0; i<(int)dequantize_ops.size(); i++)
+    {
+        dequantize_ops[i]->destroy_pipeline(opt_cpu);
+        delete dequantize_ops[i];
+    }
+    dequantize_ops.clear();
 
     return 0;
 }
@@ -150,19 +200,24 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
     {
         if (keep_h)
 	  return -101; // not implemented
-        Mat bottom_blob_int8;
-        bottom_blob_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
-        if (bottom_blob_int8.empty())
-            return -100;
 
-        // quantize, scale and round to nearest
+        Mat bottom_blob_tm = bottom_blob;
+        if (elemsize != 1)
         {
-            ncnn::ParamDict pd;
-            pd.set(0, bottom_blob_int8_scale);// scale
+            Mat bottom_blob_int8;
+            bottom_blob_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
+            if (bottom_blob_int8.empty())
+                return -100;
 
-            quantize->load_param(pd);
+            // quantize, scale and round to nearest
+            {
+                ncnn::Option opt_g = opt;
+                opt_g.blob_allocator = bottom_blob_int8.allocator;
 
-            quantize->forward(bottom_blob, bottom_blob_int8, opt);
+                quantize->forward(bottom_blob, bottom_blob_int8, opt_g);
+            }
+
+            bottom_blob_tm = bottom_blob_int8;
         }
 
         // num_output
@@ -176,7 +231,7 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
             for (int q=0; q<channels; q++)
             {
                 const signed char* w = (const signed char*)weight_data + size * channels * p + size * q;
-                const signed char* m = bottom_blob_int8.channel(q);
+                const signed char* m = bottom_blob_tm.channel(q);
 
                 for (int i = 0; i < size; i++)
                 {
@@ -184,26 +239,29 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
                 }
             }
 
-            out[p] = sum;
+            out[p] = sum;       
         }
 
-        // dequantize, reverse scale inplace
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int p=0; p<num_output; p++)
         {
-            float top_rescale = 1.f / (bottom_blob_int8_scale * weight_data_int8_scale);
+            int* out_s32 = top_blob;
+            float* out_f32 = top_blob;
+            float top_rescale = 1.f;
+            if (weight_data_int8_scales[p] == 0)
+                top_rescale = 0;
+            else
+                top_rescale = 1.f / (bottom_blob_int8_scale * weight_data_int8_scales[p]);
 
-            ncnn::ParamDict pd;
-            pd.set(0, top_rescale);// scale
-            pd.set(1, bias_term);// bias_term
-            pd.set(2, num_output);// bias_data_size
+            if (bias_term)
+                out_f32[p] = out_s32[p] * top_rescale + bias_data[p];
+            else
+                out_f32[p] = out_s32[p] * top_rescale;
 
-            dequantize->load_param(pd);
-
-            ncnn::Mat weights[1];
-            weights[0] = bias_data;
-
-            dequantize->load_model(ModelBinFromMatArray(weights));
-
-            dequantize->forward_inplace(top_blob, opt);
+            if (activation_type == 1)
+            {
+                out_f32[p] = std::max(out_f32[p], 0.f);
+            }                
         }
 
         return 0;
@@ -259,177 +317,35 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
             }
         }
 
+        if (activation_type == 1)
+        {
+            sum = std::max(sum, 0.f);
+        }
+        else if (activation_type == 2)
+        {
+            float slope = activation_params[0];
+            sum = sum > 0.f ? sum : sum * slope;
+        }
+        else if (activation_type == 3)
+        {
+            float min = activation_params[0];
+            float max = activation_params[1];
+            if (sum < min)
+                sum = min;
+            if (sum > max)
+                sum = max;
+        }
+        else if (activation_type == 4)
+        {
+            sum = 1.f / (1.f + exp(-sum));
+        }
+
         top_blob[p] = sum;
     }
 
-    return 0;
-}
-
-#if NCNN_VULKAN
-int InnerProduct::upload_model(VkTransfer& cmd)
-{
-    cmd.record_upload(weight_data, weight_data_gpu);
-
-    if (bias_term)
-    {
-        cmd.record_upload(bias_data, bias_data_gpu);
-    }
-
-    // pack4
-    if (num_output % 4 == 0)
-    {
-        int num_input = weight_data_size / num_output;
-
-//         convert_packing(weight_data_r2, weight_data_pack4, 4);
-        // src = inch-outch
-        // dst = 4a-4b-inch/4a-outch/4b
-        {
-            Mat weight_data_r2 = weight_data.reshape(num_input, num_output);
-
-            weight_data_pack4 = Mat(16, num_input/4, num_output/4);
-
-            for (int q=0; q+3<num_output; q+=4)
-            {
-                const float* k0 = weight_data_r2.row(q);
-                const float* k1 = weight_data_r2.row(q+1);
-                const float* k2 = weight_data_r2.row(q+2);
-                const float* k3 = weight_data_r2.row(q+3);
-
-                float* g00 = weight_data_pack4.channel(q/4);
-
-                for (int p=0; p+3<num_input; p+=4)
-                {
-                    g00[0] = k0[0];
-                    g00[1] = k0[1];
-                    g00[2] = k0[2];
-                    g00[3] = k0[3];
-
-                    g00[4] = k1[0];
-                    g00[5] = k1[1];
-                    g00[6] = k1[2];
-                    g00[7] = k1[3];
-
-                    g00[8] = k2[0];
-                    g00[9] = k2[1];
-                    g00[10] = k2[2];
-                    g00[11] = k2[3];
-
-                    g00[12] = k3[0];
-                    g00[13] = k3[1];
-                    g00[14] = k3[2];
-                    g00[15] = k3[3];
-
-                    k0 += 4;
-                    k1 += 4;
-                    k2 += 4;
-                    k3 += 4;
-                    g00 += 16;
-                }
-            }
-        }
-
-        weight_data_pack4 = weight_data_pack4.reshape(16 * (num_input/4) * (num_output/4));
-        cmd.record_upload(weight_data_pack4, weight_data_gpu_pack4);
-
-        if (bias_term)
-        {
-            convert_packing(bias_data, bias_data_pack4, 4);
-            cmd.record_upload(bias_data_pack4, bias_data_gpu_pack4);
-        }
-    }
-
-    return 0;
-}
-
-int InnerProduct::create_pipeline()
-{
-    pipeline_innerproduct = new Pipeline(vkdev);
-    pipeline_innerproduct->set_optimal_local_size_xyz(num_output, 1, 1);
-
-    std::vector<vk_specialization_type> specializations(1);
-    specializations[0].i = bias_term;
-
-    pipeline_innerproduct->create("innerproduct", specializations, 4, 10);
-
-    flatten->create_pipeline();
-
-    // pack4
-    if (num_output % 4 == 0)
-    {
-        pipeline_innerproduct_pack4 = new Pipeline(vkdev);
-        pipeline_innerproduct_pack4->set_optimal_local_size_xyz(num_output / 4, 1, 1);
-        pipeline_innerproduct_pack4->create("innerproduct_pack4", specializations, 4, 10);
-    }
-
-    return 0;
-}
-
-int InnerProduct::destroy_pipeline()
-{
-    if (flatten)
-        flatten->destroy_pipeline();
-
-    delete pipeline_innerproduct;
-    pipeline_innerproduct = 0;
-
-    delete pipeline_innerproduct_pack4;
-    pipeline_innerproduct_pack4 = 0;
-
-    return 0;
-}
-
-int InnerProduct::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
-{
-    int dims = bottom_blob.dims;
-    size_t elemsize = bottom_blob.elemsize;
-    int packing = bottom_blob.packing;
-
-    // flatten
-    VkMat bottom_blob_flattened = bottom_blob;
-    {
-        ncnn::Option opt_flatten = opt;
-        opt_flatten.blob_vkallocator = opt.workspace_vkallocator;
-
-        flatten->forward(bottom_blob, bottom_blob_flattened, cmd, opt_flatten);
-    }
-
-    // TODO assert num_output % packing == 0
-
     if (keep_h)
       return -101;
-    top_blob.create(num_output / packing, elemsize, packing, opt.blob_vkallocator, opt.staging_vkallocator);
-    if (top_blob.empty())
-        return -100;
-
-//     fprintf(stderr, "InnerProduct::forward %p %p\n", bottom_blob_flattened.buffer(), top_blob.buffer());
-
-    std::vector<VkMat> bindings(4);
-    bindings[0] = bottom_blob_flattened;
-    bindings[1] = top_blob;
-    bindings[2] = packing == 4 ? weight_data_gpu_pack4 : weight_data_gpu;
-    bindings[3] = bias_term ? (packing == 4 ? bias_data_gpu_pack4 : bias_data_gpu) : weight_data_gpu;// TODO use dummy buffer
-
-    std::vector<vk_constant_type> constants(10);
-    constants[0].i = bottom_blob_flattened.dims;
-    constants[1].i = bottom_blob_flattened.w;
-    constants[2].i = bottom_blob_flattened.h;
-    constants[3].i = bottom_blob_flattened.c;
-    constants[4].i = bottom_blob_flattened.cstep;
-    constants[5].i = top_blob.dims;
-    constants[6].i = top_blob.w;
-    constants[7].i = top_blob.h;
-    constants[8].i = top_blob.c;
-    constants[9].i = top_blob.cstep;
-
-    const Pipeline* pipeline = packing == 4 ? pipeline_innerproduct_pack4 : pipeline_innerproduct;
-
-    // record
-    cmd.record_prepare_compute_barrier(bottom_blob_flattened);
-    cmd.record_prepare_compute_barrier(top_blob);
-    cmd.record_pipeline(pipeline, bindings, constants, top_blob);
-
     return 0;
 }
-#endif // NCNN_VULKAN
 
 } // namespace ncnn

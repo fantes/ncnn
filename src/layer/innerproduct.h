@@ -23,22 +23,15 @@ class InnerProduct : public Layer
 {
 public:
     InnerProduct();
-    ~InnerProduct();
 
     virtual int load_param(const ParamDict& pd);
 
     virtual int load_model(const ModelBin& mb);
 
+    virtual int create_pipeline(const Option& opt);
+    virtual int destroy_pipeline(const Option& opt);
+
     virtual int forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
-
-#if NCNN_VULKAN
-    virtual int upload_model(VkTransfer& cmd);
-
-    virtual int create_pipeline();
-    virtual int destroy_pipeline();
-
-    virtual int forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const;
-#endif // NCNN_VULKAN
 
 public:
     // param
@@ -55,33 +48,21 @@ public:
     // implemented only on non_vulkan non int8_inference
     int keep_h;
 
+    // 0=none 1=relu 2=leakyrelu 3=clip 4=sigmoid
+    int activation_type;
+    Mat activation_params;
+
     // model
     Mat weight_data;
     Mat bias_data;
 
-#if NCNN_VULKAN
-    ncnn::Layer* flatten;
-
-    VkMat weight_data_gpu;
-    VkMat bias_data_gpu;
-
-    Pipeline* pipeline_innerproduct;
-
-    // pack4
-    Mat weight_data_pack4;
-    Mat bias_data_pack4;
-    VkMat weight_data_gpu_pack4;
-    VkMat bias_data_gpu_pack4;
-    Pipeline* pipeline_innerproduct_pack4;
-#endif // NCNN_VULKAN
-
-    float weight_data_int8_scale;
+    Mat weight_data_int8_scales;
     float bottom_blob_int8_scale;
 
     bool use_int8_inference;
 
     ncnn::Layer* quantize;
-    ncnn::Layer* dequantize;
+    std::vector<ncnn::Layer*> dequantize_ops;
 };
 
 } // namespace ncnn

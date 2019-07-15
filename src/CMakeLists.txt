@@ -10,7 +10,6 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/layer)
 if(NCNN_VULKAN)
     find_program(GLSLANGVALIDATOR_EXECUTABLE NAMES glslangValidator PATHS $ENV{VULKAN_SDK}/bin NO_CMAKE_FIND_ROOT_PATH)
     message(STATUS "Found glslangValidator: ${GLSLANGVALIDATOR_EXECUTABLE}")
-    include_directories(${Vulkan_INCLUDE_DIR})
 endif()
 
 set(ncnn_SRCS
@@ -26,6 +25,7 @@ set(ncnn_SRCS
     modelbin.cpp
     net.cpp
     opencv.cpp
+    option.cpp
     paramdict.cpp
     pipeline.cpp
     benchmark.cpp
@@ -56,46 +56,52 @@ macro(ncnn_add_layer class)
         else()
             set(arch x86)
         endif()
-        set(LAYER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/layer/${arch}/${name}_${arch}.cpp)
-        if(EXISTS ${LAYER_SRC})
+
+        set(LAYER_ARCH_SRC ${CMAKE_CURRENT_SOURCE_DIR}/layer/${arch}/${name}_${arch}.cpp)
+        if(EXISTS ${LAYER_ARCH_SRC})
             set(WITH_LAYER_${name}_${arch} 1)
-            list(APPEND ncnn_SRCS ${LAYER_SRC})
-            if(NCNN_CMAKE_VERBOSE)
-                message(STATUS "Adding layer: ${LAYER_SRC}")
-            endif()
+            list(APPEND ncnn_SRCS ${LAYER_ARCH_SRC})
+        endif()
+
+        set(LAYER_VULKAN_SRC ${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/${name}_vulkan.cpp)
+        if(NCNN_VULKAN AND EXISTS ${LAYER_VULKAN_SRC})
+            set(WITH_LAYER_${name}_vulkan 1)
+            list(APPEND ncnn_SRCS ${LAYER_VULKAN_SRC})
         endif()
     endif()
 
     # generate layer_declaration and layer_registry file
     if(WITH_LAYER_${name})
-        if(WITH_LAYER_${name}_${arch})
-            string(APPEND layer_declaration
-                "extern Layer* ${class}_${arch}_layer_creator();\n")
-            string(APPEND layer_registry
-                "#if NCNN_STRING\n{\"${class}\",${class}_${arch}_layer_creator},\n#else\n{${class}_${arch}_layer_creator},\n#endif\n")
-        else()
-            string(APPEND layer_declaration
-                "extern Layer* ${class}_layer_creator();\n")
-            string(APPEND layer_registry
-                "#if NCNN_STRING\n{\"${class}\",${class}_layer_creator},\n#else\n{${class}_layer_creator},\n#endif\n")
-        endif()
-    else()
-        string(APPEND layer_registry "#if NCNN_STRING\n{\"${class}\",0},\n#else\n{0},\n#endif\n")
+        set(layer_declaration "${layer_declaration}#include \"layer/${name}.h\"\n")
+        set(layer_declaration_class "class ${class}_final : virtual public ${class}")
+        set(create_pipeline_content "        { int ret = ${class}::create_pipeline(opt); if (ret) return ret; }\n")
+        set(destroy_pipeline_content "        { int ret = ${class}::destroy_pipeline(opt); if (ret) return ret; }\n")
     endif()
 
-    if(WITH_LAYER_${name} AND NCNN_VULKAN)
-        file(GLOB_RECURSE SHADER_SRCS "layer/shader/${name}.comp")
-        file(GLOB_RECURSE SHADER_SUBSRCS "layer/shader/${name}_*.comp")
+    if(WITH_LAYER_${name}_${arch})
+        set(layer_declaration "${layer_declaration}#include \"layer/${arch}/${name}_${arch}.h\"\n")
+        set(layer_declaration_class "${layer_declaration_class}, virtual public ${class}_${arch}")
+        set(create_pipeline_content "${create_pipeline_content}        { int ret = ${class}_${arch}::create_pipeline(opt); if (ret) return ret; }\n")
+        set(destroy_pipeline_content "        { int ret = ${class}_${arch}::destroy_pipeline(opt); if (ret) return ret; }\n${destroy_pipeline_content}")
+    endif()
+
+    if(WITH_LAYER_${name}_vulkan)
+        set(layer_declaration "${layer_declaration}#include \"layer/vulkan/${name}_vulkan.h\"\n")
+        set(layer_declaration_class "${layer_declaration_class}, virtual public ${class}_vulkan")
+        set(create_pipeline_content "${create_pipeline_content}        if (opt.use_vulkan_compute) { int ret = ${class}_vulkan::create_pipeline(opt); if (ret) return ret; }\n")
+        set(destroy_pipeline_content "        if (opt.use_vulkan_compute) { int ret = ${class}_vulkan::destroy_pipeline(opt); if (ret) return ret; }\n${destroy_pipeline_content}")
+
+        file(GLOB_RECURSE SHADER_SRCS "layer/vulkan/shader/${name}.comp")
+        file(GLOB_RECURSE SHADER_SUBSRCS "layer/vulkan/shader/${name}_*.comp")
         list(APPEND SHADER_SRCS ${SHADER_SUBSRCS})
         foreach(SHADER_SRC ${SHADER_SRCS})
-            get_filename_component(SHADER_SRC_NAME ${SHADER_SRC} NAME)
             get_filename_component(SHADER_SRC_NAME_WE ${SHADER_SRC} NAME_WE)
 
             set(SHADER_SPV_HEX_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}.spv.hex.h)
             add_custom_command(
                 OUTPUT ${SHADER_SPV_HEX_FILE}
                 COMMAND ${GLSLANGVALIDATOR_EXECUTABLE}
-                ARGS -V -s -e ${SHADER_SRC_NAME_WE} --source-entrypoint main -x -o ${SHADER_SPV_HEX_FILE} ${SHADER_SRC}
+                ARGS -Dsfp=float -Dsfpvec2=vec2 -Dsfpvec4=vec4 -Dsfpmat4=mat4 -Dafp=float -Dafpvec2=vec2 -Dafpvec4=vec4 -Dafpmat4=mat4 -Dsfp2afp\(v\)=v -Dafp2sfp\(v\)=v -Dsfp2afpvec2\(v\)=v -Dafp2sfpvec2\(v\)=v -Dsfp2afpvec4\(v\)=v -Dafp2sfpvec4\(v\)=v -Dsfp2afpmat4\(v\)=v -Dafp2sfpmat4\(v\)=v -V -s -e ${SHADER_SRC_NAME_WE} --source-entrypoint main -x -o ${SHADER_SPV_HEX_FILE} ${SHADER_SRC}
                 DEPENDS ${SHADER_SRC}
                 COMMENT "Building SPIR-V module ${SHADER_SRC_NAME_WE}.spv"
                 VERBATIM
@@ -106,7 +112,79 @@ macro(ncnn_add_layer class)
             string(APPEND layer_shader_registry "{\"${SHADER_SRC_NAME_WE}\",${SHADER_SRC_NAME_WE}_spv_data,sizeof(${SHADER_SRC_NAME_WE}_spv_data)},\n")
 
             list(APPEND SHADER_SPV_HEX_FILES ${SHADER_SPV_HEX_FILE})
+
+            # fp16 packed
+            set(SHADER_fp16p_SRC_NAME_WE "${SHADER_SRC_NAME_WE}_fp16p")
+
+            set(SHADER_fp16p_SPV_HEX_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_fp16p_SRC_NAME_WE}.spv.hex.h)
+            add_custom_command(
+                OUTPUT ${SHADER_fp16p_SPV_HEX_FILE}
+                COMMAND ${GLSLANGVALIDATOR_EXECUTABLE}
+                ARGS -Dsfp=float -Dsfpvec2=uint -Dsfpvec4=uvec2 -Dafp=float -Dafpvec2=vec2 -Dafpvec4=vec4 -Dafpmat4=mat4 -Dsfp2afp\(v\)=v -Dafp2sfp\(v\)=v -Dsfp2afpvec2\(v\)=unpackHalf2x16\(v\) -Dafp2sfpvec2\(v\)=packHalf2x16\(v\) -Dsfp2afpvec4\(v\)=vec4\(unpackHalf2x16\(v.x\),unpackHalf2x16\(v.y\)\) -Dafp2sfpvec4\(v\)=uvec2\(packHalf2x16\(v.rg\),packHalf2x16\(v.ba\)\) -DNCNN_fp16_packed=1 -V -s -e ${SHADER_fp16p_SRC_NAME_WE} --source-entrypoint main -x -o ${SHADER_fp16p_SPV_HEX_FILE} ${SHADER_SRC}
+                DEPENDS ${SHADER_SRC}
+                COMMENT "Building SPIR-V module ${SHADER_fp16p_SRC_NAME_WE}.spv"
+                VERBATIM
+            )
+            set_source_files_properties(${SHADER_fp16p_SPV_HEX_FILE} PROPERTIES GENERATED TRUE)
+
+            string(APPEND layer_shader_spv_data "static const uint32_t ${SHADER_fp16p_SRC_NAME_WE}_spv_data[] = {\n#include \"${SHADER_fp16p_SRC_NAME_WE}.spv.hex.h\"\n};\n")
+            string(APPEND layer_shader_registry "{\"${SHADER_fp16p_SRC_NAME_WE}\",${SHADER_fp16p_SRC_NAME_WE}_spv_data,sizeof(${SHADER_fp16p_SRC_NAME_WE}_spv_data)},\n")
+
+            list(APPEND SHADER_SPV_HEX_FILES ${SHADER_fp16p_SPV_HEX_FILE})
+
+            # fp16 storage
+            set(SHADER_fp16s_SRC_NAME_WE "${SHADER_SRC_NAME_WE}_fp16s")
+
+            set(SHADER_fp16s_SPV_HEX_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_fp16s_SRC_NAME_WE}.spv.hex.h)
+            add_custom_command(
+                OUTPUT ${SHADER_fp16s_SPV_HEX_FILE}
+                COMMAND ${GLSLANGVALIDATOR_EXECUTABLE}
+                ARGS -Dsfp=float16_t -Dsfpvec2=f16vec2 -Dsfpvec4=f16vec4 -Dafp=float -Dafpvec2=vec2 -Dafpvec4=vec4 -Dafpmat4=mat4 -Dsfp2afp\(v\)=float\(v\) -Dafp2sfp\(v\)=float16_t\(v\) -Dsfp2afpvec2\(v\)=vec2\(v\) -Dafp2sfpvec2\(v\)=f16vec2\(v\) -Dsfp2afpvec4\(v\)=vec4\(v\) -Dafp2sfpvec4\(v\)=f16vec4\(v\) -DNCNN_fp16_storage=1 -V -s -e ${SHADER_fp16s_SRC_NAME_WE} --source-entrypoint main -x -o ${SHADER_fp16s_SPV_HEX_FILE} ${SHADER_SRC}
+                DEPENDS ${SHADER_SRC}
+                COMMENT "Building SPIR-V module ${SHADER_fp16s_SRC_NAME_WE}.spv"
+                VERBATIM
+            )
+            set_source_files_properties(${SHADER_fp16s_SPV_HEX_FILE} PROPERTIES GENERATED TRUE)
+
+            string(APPEND layer_shader_spv_data "static const uint32_t ${SHADER_fp16s_SRC_NAME_WE}_spv_data[] = {\n#include \"${SHADER_fp16s_SRC_NAME_WE}.spv.hex.h\"\n};\n")
+            string(APPEND layer_shader_registry "{\"${SHADER_fp16s_SRC_NAME_WE}\",${SHADER_fp16s_SRC_NAME_WE}_spv_data,sizeof(${SHADER_fp16s_SRC_NAME_WE}_spv_data)},\n")
+
+            list(APPEND SHADER_SPV_HEX_FILES ${SHADER_fp16s_SPV_HEX_FILE})
+
+            # fp16 storage + fp16 arithmetic
+            set(SHADER_fp16a_SRC_NAME_WE "${SHADER_SRC_NAME_WE}_fp16a")
+
+            set(SHADER_fp16a_SPV_HEX_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_fp16a_SRC_NAME_WE}.spv.hex.h)
+            add_custom_command(
+                OUTPUT ${SHADER_fp16a_SPV_HEX_FILE}
+                COMMAND ${GLSLANGVALIDATOR_EXECUTABLE}
+                ARGS -Dsfp=float16_t -Dsfpvec2=f16vec2 -Dsfpvec4=f16vec4 -Dsfpmat4=f16mat4 -Dafp=float16_t -Dafpvec2=f16vec2 -Dafpvec4=f16vec4 -Dafpmat4=f16mat4 -Dsfp2afp\(v\)=v -Dafp2sfp\(v\)=v -Dsfp2afpvec2\(v\)=v -Dafp2sfpvec2\(v\)=v -Dsfp2afpvec4\(v\)=v -Dafp2sfpvec4\(v\)=v -Dsfp2afpmat4\(v\)=v -Dafp2sfpmat4\(v\)=v -DNCNN_fp16_storage=1 -DNCNN_fp16_arithmetic=1 -V -s -e ${SHADER_fp16a_SRC_NAME_WE} --source-entrypoint main -x -o ${SHADER_fp16a_SPV_HEX_FILE} ${SHADER_SRC}
+                DEPENDS ${SHADER_SRC}
+                COMMENT "Building SPIR-V module ${SHADER_fp16a_SRC_NAME_WE}.spv"
+                VERBATIM
+            )
+            set_source_files_properties(${SHADER_fp16a_SPV_HEX_FILE} PROPERTIES GENERATED TRUE)
+
+            string(APPEND layer_shader_spv_data "static const uint32_t ${SHADER_fp16a_SRC_NAME_WE}_spv_data[] = {\n#include \"${SHADER_fp16a_SRC_NAME_WE}.spv.hex.h\"\n};\n")
+            string(APPEND layer_shader_registry "{\"${SHADER_fp16a_SRC_NAME_WE}\",${SHADER_fp16a_SRC_NAME_WE}_spv_data,sizeof(${SHADER_fp16a_SRC_NAME_WE}_spv_data)},\n")
+
+            list(APPEND SHADER_SPV_HEX_FILES ${SHADER_fp16a_SPV_HEX_FILE})
         endforeach()
+    endif()
+
+    if(WITH_LAYER_${name})
+        set(layer_declaration "${layer_declaration}namespace ncnn {\n${layer_declaration_class}\n{\n")
+        set(layer_declaration "${layer_declaration}public:\n")
+        set(layer_declaration "${layer_declaration}    virtual int create_pipeline(const Option& opt) {\n${create_pipeline_content}        return 0;\n    }\n")
+        set(layer_declaration "${layer_declaration}    virtual int destroy_pipeline(const Option& opt) {\n${destroy_pipeline_content}        return 0;\n    }\n")
+        set(layer_declaration "${layer_declaration}};\n")
+        set(layer_declaration "${layer_declaration}DEFINE_LAYER_CREATOR(${class}_final)\n} // namespace ncnn\n\n")
+    endif()
+
+    if(WITH_LAYER_${name})
+        set(layer_registry "${layer_registry}#if NCNN_STRING\n{\"${class}\",${class}_final_layer_creator},\n#else\n{${class}_final_layer_creator},\n#endif\n")
+    else()
+        set(layer_registry "${layer_registry}#if NCNN_STRING\n{\"${class}\",0},\n#else\n{0},\n#endif\n")
     endif()
 
     # generate layer_type_enum file
@@ -184,8 +262,11 @@ ncnn_add_layer(PSROIPooling)
 ncnn_add_layer(ROIAlign OFF)
 ncnn_add_layer(Packing)
 ncnn_add_layer(ContinuationIndicator)
+ncnn_add_layer(Requantize)
+ncnn_add_layer(Cast)
+ncnn_add_layer(HardSigmoid)
+ncnn_add_layer(SELU)
 
-# message("SHADER_SPV_HEX_FILES = ${SHADER_SPV_HEX_FILES}")
 add_custom_target(generate-spirv DEPENDS ${SHADER_SPV_HEX_FILES})
 
 # create new
@@ -206,12 +287,9 @@ if(NCNN_OPENMP AND OpenMP_CXX_FOUND)
     target_link_libraries(ncnn PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
-if(COVERAGE)
-    target_compile_options(ncnn PRIVATE --coverage)
-endif()
-
-install(TARGETS ncnn ARCHIVE DESTINATION lib)
-install(FILES
+if(NCNN_INSTALL_SDK)
+  install(TARGETS ncnn ARCHIVE DESTINATION lib)
+  install(FILES
     allocator.h
     blob.h
     command.h
@@ -223,10 +301,12 @@ install(FILES
     modelbin.h
     net.h
     opencv.h
+    option.h
     paramdict.h
     pipeline.h
     benchmark.h
     ${CMAKE_CURRENT_BINARY_DIR}/layer_type_enum.h
     ${CMAKE_CURRENT_BINARY_DIR}/platform.h
     DESTINATION include
-)
+  )
+endif()
