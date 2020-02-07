@@ -27,11 +27,13 @@ public:
     virtual int create_pipeline(const Option& opt);
     virtual int destroy_pipeline(const Option& opt);
 
+    using Permute::forward;
     virtual int forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const;
 
 public:
     Pipeline* pipeline_permute;
     Pipeline* pipeline_permute_pack4to1;
+    Pipeline* pipeline_permute_pack8to1;
 };
 
 } // namespace ncnn
